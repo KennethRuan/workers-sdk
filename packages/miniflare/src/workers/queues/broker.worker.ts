@@ -2,6 +2,7 @@ import assert from "node:assert";
 import { Buffer } from "node:buffer";
 import { bold, green, grey, red, reset, yellow } from "kleur/colors";
 import {
+	GET,
 	HttpError,
 	LogLevel,
 	MiniflareDurableObject,
@@ -149,13 +150,34 @@ function serialise(msg: QueueMessage): QueueOutgoingMessage {
 }
 
 class QueueMessage {
+	static #encoder = new TextEncoder();
+	/**
+	 * Message body size in bytes. This is an approximation of production behaviour and may not be the exact same.
+	 */
+	#bytes = 0;
 	#failedAttempts = 0;
 
 	constructor(
 		readonly id: string,
 		readonly timestamp: Date,
 		readonly body: QueueBody
-	) {}
+	) {
+		this.#bytes = QueueMessage.#byteLength(body);
+	}
+
+	static #byteLength(body: QueueBody): number {
+		switch (body.contentType) {
+			case "text":
+				return this.#encoder.encode(body.body).byteLength;
+			case "json":
+				return this.#encoder.encode(JSON.stringify(body.body)).byteLength;
+			case "bytes":
+			case "v8":
+				return body.body.byteLength;
+			default:
+				assert(false);
+		}
+	}
 
 	incrementFailedAttempts(): number {
 		return ++this.#failedAttempts;
@@ -163,6 +185,10 @@ class QueueMessage {
 
 	get failedAttempts() {
 		return this.#failedAttempts;
+	}
+
+	get bytes() {
+		return this.#bytes;
 	}
 }
 
@@ -203,6 +229,7 @@ export class QueueBrokerObject extends MiniflareDurableObject<QueueBrokerObjectE
 	readonly #consumers: Record<string, QueueConsumer | undefined>;
 	readonly #messages: QueueMessage[] = [];
 	#pendingFlush?: PendingFlush;
+	#backlogBytes = 0;
 
 	constructor(state: DurableObjectState, env: QueueBrokerObjectEnv) {
 		super(state, env);
@@ -226,7 +253,11 @@ export class QueueBrokerObject extends MiniflareDurableObject<QueueBrokerObjectE
 		return this.#consumers[this.name];
 	}
 
-	#dispatchBatch(workerName: string, batch: QueueMessage[]) {
+	#dispatchBatch(
+		workerName: string,
+		batch: QueueMessage[],
+		metadata?: MessageBatchMetadata
+	) {
 		const bindingName =
 			`${QueueBindings.SERVICE_WORKER_PREFIX}${workerName}` as const;
 		const maybeService = this.env[bindingName];
@@ -242,7 +273,8 @@ export class QueueBrokerObject extends MiniflareDurableObject<QueueBrokerObjectE
 				return { id, timestamp, body: body.body, attempts };
 			}
 		});
-		return maybeService.queue(this.name, messages);
+
+		return maybeService.queue(this.name, messages, metadata);
 	}
 
 	#flush = async () => {
@@ -255,11 +287,16 @@ export class QueueBrokerObject extends MiniflareDurableObject<QueueBrokerObjectE
 
 		// Extract and dispatch a batch
 		const batch = this.#messages.splice(0, batchSize);
+		const metadata = { metrics: this.#metrics() };
 		const startTime = Date.now();
 		let endTime: number;
 		let response: FetcherQueueResult;
 		try {
-			response = await this.#dispatchBatch(consumer.workerName, batch);
+			response = await this.#dispatchBatch(
+				consumer.workerName,
+				batch,
+				metadata
+			);
 			endTime = Date.now();
 		} catch (e: any) {
 			endTime = Date.now();
@@ -290,6 +327,7 @@ export class QueueBrokerObject extends MiniflareDurableObject<QueueBrokerObjectE
 
 					const fn = () => {
 						this.#messages.push(message);
+						this.#backlogBytes += message.bytes;
 						this.#ensurePendingFlush();
 					};
 					const delay = retryMessages.get(message.id) ?? globalDelay;
@@ -309,6 +347,7 @@ export class QueueBrokerObject extends MiniflareDurableObject<QueueBrokerObjectE
 			}
 		}
 		const acked = batch.length - failedMessages;
+		this.#backlogBytes -= batch.reduce((total, msg) => total + msg.bytes, 0);
 		await this.logWithLevel(
 			LogLevel.INFO,
 			formatQueueResponse(this.name, acked, batch.length, endTime - startTime)
@@ -372,6 +411,7 @@ export class QueueBrokerObject extends MiniflareDurableObject<QueueBrokerObjectE
 
 			const fn = () => {
 				this.#messages.push(msg);
+				this.#backlogBytes += msg.bytes;
 				this.#ensurePendingFlush();
 			};
 
@@ -380,11 +420,25 @@ export class QueueBrokerObject extends MiniflareDurableObject<QueueBrokerObjectE
 		}
 	}
 
+	#metrics() {
+		return {
+			backlogCount: this.#messages.length,
+			backlogBytes: this.#backlogBytes,
+			oldestMessageTimestamp: this.#messages[0]?.timestamp,
+		};
+	}
+
 	@POST("/message")
 	message: RouteHandler = async (req) => {
 		// If we don't have a consumer, drop the message
 		const consumer = this.#maybeConsumer;
-		if (consumer === undefined) return new Response();
+		if (consumer === undefined) {
+			return Response.json({
+				metadata: {
+					metrics: this.#metrics(),
+				},
+			});
+		}
 
 		validateMessageSize(req.headers);
 		const contentType = validateContentType(req.headers);
@@ -396,14 +450,24 @@ export class QueueBrokerObject extends MiniflareDurableObject<QueueBrokerObjectE
 			[{ contentType, delaySecs: delay, body }],
 			this.#maybeProducer?.deliveryDelay
 		);
-		return new Response();
+		return Response.json({
+			metadata: {
+				metrics: this.#metrics(),
+			},
+		});
 	};
 
 	@POST("/batch")
 	batch: RouteHandler = async (req) => {
 		// If we don't have a consumer, drop the message
 		const consumer = this.#maybeConsumer;
-		if (consumer === undefined) return new Response();
+		if (consumer === undefined) {
+			return Response.json({
+				metadata: {
+					metrics: this.#metrics(),
+				},
+			});
+		}
 
 		// NOTE: this endpoint is also used when moving messages to the dead-letter
 		// queue. In this case, size headers won't be added and this validation is
@@ -415,6 +479,15 @@ export class QueueBrokerObject extends MiniflareDurableObject<QueueBrokerObjectE
 		const body = QueuesBatchRequestSchema.parse(await req.json());
 
 		this.#enqueue(body.messages, delay);
-		return new Response();
+		return Response.json({
+			metadata: {
+				metrics: this.#metrics(),
+			},
+		});
+	};
+
+	@GET("/metrics")
+	metrics: RouteHandler = async (_req) => {
+		return Response.json(this.#metrics());
 	};
 }
